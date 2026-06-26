@@ -1024,32 +1024,47 @@ void SyncESPDataOnMainThread() {
 // Update函数（主线程帧回调）
 void Update(void * UpdateInstance) {
 
-    // 【核心改动】如果开启了透视或者自瞄，在主线程每帧高频更新位置坐标，实现 0 延迟无残影
+    // 【核心改动】如果开启了透视或者自瞄，在主线程每帧高频更新位置坐标
     if (isESP || g_BulletTrackEnabled) {
         static bool firstUpdate = true;
         if (firstUpdate) {
-            RefreshPlayerList(true);  // 首次强制实体搜索，立即填充玩家列表
+            RefreshPlayerList(true);
             firstUpdate = false;
         } else {
-            RefreshPlayerList(false); // 后续高频更新位置，每60帧重新搜索
+            RefreshPlayerList(false);
         }
     }
 
-    // 武器修改（保持你原有的逻辑不变）
-    if (g_WeaponModEnabled) {
-        void* weaponType = Type_GetTypeName(Il2CppString::CreateMonoString("Weapon,Assembly-CSharp.dll"));
-        if (weaponType) {
-            MonoArray<void**>* weaponList = Object_FindObjectsOfType(weaponType);
-            if (weaponList && weaponList->getLength() > 0) {
-                std::lock_guard<std::mutex> weaponLock(g_WeaponMutex);
-                g_WeaponObjects.clear();
-                
-                for(int i = 0; i < weaponList->getLength(); i++) {
-                    void* weapon = weaponList->getPointer()[i];
-                    if(m_CachedPtr(weapon)) {
-                        g_WeaponObjects.push_back(weapon);
-                        ModifyWeapon(weapon);
+    // 武器修改 + 子弹追踪速度（每60帧搜索一次武器列表，符合降频铁律）
+    if (g_WeaponModEnabled || g_BulletTrackEnabled) {
+        static int weaponSearchFrame = 0;
+        weaponSearchFrame++;
+        if (weaponSearchFrame % 60 == 0) {
+            void* weaponType = Type_GetTypeName(Il2CppString::CreateMonoString("Weapon,Assembly-CSharp.dll"));
+            if (weaponType) {
+                MonoArray<void**>* weaponList = Object_FindObjectsOfType(weaponType);
+                if (weaponList && weaponList->getLength() > 0) {
+                    std::lock_guard<std::mutex> weaponLock(g_WeaponMutex);
+                    g_WeaponObjects.clear();
+                    for(int i = 0; i < weaponList->getLength(); i++) {
+                        void* weapon = weaponList->getPointer()[i];
+                        if(m_CachedPtr(weapon)) {
+                            g_WeaponObjects.push_back(weapon);
+                        }
                     }
+                }
+            }
+        }
+        // 每帧对已缓存的武器写入修改（安全：只写 int/float 值字段，不调 Unity API）
+        {
+            std::lock_guard<std::mutex> weaponLock(g_WeaponMutex);
+            for (void* weapon : g_WeaponObjects) {
+                if (!m_CachedPtr(weapon)) continue;
+                if (g_WeaponModEnabled) ModifyWeapon(weapon);
+                if (g_BulletTrackEnabled) {
+                    // 直接写 Weapon.bulletSpeed 偏移 0x3C，速度5000=几乎瞬间命中
+                    int* speedPtr = (int*)((uintptr_t)weapon + 0x3C);
+                    if (speedPtr) *speedPtr = 5000;
                 }
             }
         }
