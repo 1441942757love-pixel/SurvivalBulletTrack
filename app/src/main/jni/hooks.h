@@ -21,6 +21,9 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <cstring>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -252,6 +255,133 @@ bool IsLikelyNativePointer(void* ptr) {
     return addr >= 0x10000ULL && addr < 0x0000800000000000ULL;
 }
 
+// 终极防崩溃：利用 Linux 内核级安全读取，避免触发硬件 SEGV
+bool SafeRead64(void* addr, uintptr_t* out_val) {
+    if (!addr) return false;
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return false;
+    
+    // 尝试将目标地址的内容写入管道
+    // 如果 addr 所在内存页已被 GC 释放，内核会返回 -1 (EFAULT)，绝对不会触发应用层崩溃！
+    ssize_t ret = write(pipefd[1], addr, sizeof(uintptr_t));
+    if (ret == sizeof(uintptr_t)) {
+        read(pipefd[0], out_val, sizeof(uintptr_t));
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return true;
+    }
+    
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return false;
+}
+
+bool SafeRead32(void* addr, uint32_t* out_val) {
+    if (!out_val) return false;
+
+    uintptr_t raw = 0;
+    if (!SafeRead64(addr, &raw)) return false;
+
+    *out_val = (uint32_t)(raw & 0xFFFFFFFFu);
+    return true;
+}
+
+bool SafeReadInt32(void* addr, int* out_val) {
+    if (!out_val) return false;
+
+    uint32_t raw = 0;
+    if (!SafeRead32(addr, &raw)) return false;
+
+    *out_val = (int)raw;
+    return true;
+}
+
+bool SafeReadFloat(void* addr, float* out_val) {
+    if (!out_val) return false;
+
+    uint32_t raw = 0;
+    if (!SafeRead32(addr, &raw)) return false;
+
+    float value = 0.0f;
+    memcpy(&value, &raw, sizeof(float));
+    if (!std::isfinite(value)) return false;
+
+    *out_val = value;
+    return true;
+}
+
+bool SafeReadVector3(void* addr, Vector3* out_val) {
+    if (!out_val) return false;
+
+    uintptr_t xyRaw = 0;
+    uintptr_t zRaw = 0;
+    if (!SafeRead64(addr, &xyRaw)) return false;
+    if (!SafeRead64((void*)((uintptr_t)addr + 0x8), &zRaw)) return false;
+
+    uint32_t xBits = (uint32_t)(xyRaw & 0xFFFFFFFFu);
+    uint32_t yBits = (uint32_t)((xyRaw >> 32) & 0xFFFFFFFFu);
+    uint32_t zBits = (uint32_t)(zRaw & 0xFFFFFFFFu);
+
+    Vector3 value;
+    memcpy(&value.X, &xBits, sizeof(float));
+    memcpy(&value.Y, &yBits, sizeof(float));
+    memcpy(&value.Z, &zBits, sizeof(float));
+    if (!std::isfinite(value.X) || !std::isfinite(value.Y) || !std::isfinite(value.Z)) return false;
+
+    *out_val = value;
+    return true;
+}
+
+bool SafeReadObjectField(void* obj, uintptr_t offset, void** out_ptr) {
+    if (!obj || !out_ptr) return false;
+
+    uintptr_t rawPtr = 0;
+    if (!SafeRead64((void*)((uintptr_t)obj + offset), &rawPtr)) return false;
+
+    void* ptr = (void*)rawPtr;
+    if (!IsLikelyIl2CppObjectPointer(ptr)) return false;
+
+    uintptr_t probe = 0;
+    if (!SafeRead64(ptr, &probe)) return false;
+
+    *out_ptr = ptr;
+    return true;
+}
+
+bool SafeWriteInt32Field(void* obj, uintptr_t offset, int value) {
+    if (!obj) return false;
+
+    void* addr = (void*)((uintptr_t)obj + offset);
+    uintptr_t probe = 0;
+    if (!SafeRead64(addr, &probe)) return false;
+
+    *(int*)addr = value;
+    return true;
+}
+
+bool SafeWriteFloatField(void* obj, uintptr_t offset, float value) {
+    if (!obj || !std::isfinite(value)) return false;
+
+    void* addr = (void*)((uintptr_t)obj + offset);
+    uintptr_t probe = 0;
+    if (!SafeRead64(addr, &probe)) return false;
+
+    *(float*)addr = value;
+    return true;
+}
+
+bool SafeWriteBoolField(void* obj, uintptr_t offset, bool value) {
+    if (!obj) return false;
+
+    void* addr = (void*)((uintptr_t)obj + offset);
+    uintptr_t probe = 0;
+    if (!SafeRead64(addr, &probe)) return false;
+
+    *(uint8_t*)addr = value ? 1 : 0;
+    return true;
+}
+
+
 ThreadPool pool(5);
 void* g_GhostAIObject = nullptr;
 void* g_AnimatorComponent = nullptr;
@@ -262,10 +392,11 @@ bool g_WeaponModEnabled = false;
 bool g_InfiniteAmmo = false;
 bool g_NoRecoil = false;
 bool g_HighDamage = false;
+bool g_NoFireCooldown = false;
 float g_BulletSpeedValue = 500.0f;
 int g_CanScopeValue = 50;
-const int kBulletTrackSpeed = 5000;
-const int kBulletTrackRange = 2000;
+const int kBulletTrackSpeed = 1500;
+const int kBulletTrackRange = 5000;
 
 bool g_MoveSpeedModEnabled = false;
 float g_WalkSpeedValue = 10.0f;   
@@ -278,11 +409,11 @@ float g_VestHealthValue = 9999.0f;
 float g_HealthSliderValue = 9999.0f;
 
 bool g_BulletTrackEnabled = false;
-float g_BulletTrackMaxDist = 300.0f;
+float g_BulletTrackMaxDist = 1200.0f;
 bool g_BulletTrackLockHead = true;
 int g_BulletTrackMode = 0;         // 0=最近距离, 1=准星指向
 bool g_ShowTrackRange = true;
-float g_TrackCircleRadius = 120.0f;
+float g_TrackCircleRadius = 180.0f;
 bool isTeamFilter = true;
 
 std::vector<void*> g_MoveBehaviourObjects;
@@ -291,6 +422,54 @@ std::vector<void*> g_PlayerHealthManagers;
 std::mutex g_PlayerHealthMutex;
 std::vector<void*> g_WeaponObjects;
 std::mutex g_WeaponMutex;
+std::atomic<bool> g_SceneAlive(false);
+std::atomic<long long> g_LastSceneAliveMs(0);
+std::atomic<uintptr_t> g_LastMainCameraPtr(0);
+std::atomic<int> g_LocalTeamHash(-1);
+
+long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void ClearSceneCaches() {
+    {
+        std::lock_guard<std::mutex> lock(g_PlayersInfoMutex);
+        g_PlayersInfo.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_BoneInfoMutex);
+        g_BoneInfos.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_WeaponMutex);
+        g_WeaponObjects.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_CameraMutex);
+        g_CameraPosition = Vector3::Zero();
+    }
+    g_LocalTeamHash.store(-1, std::memory_order_release);
+    g_LastMainCameraPtr.store(0, std::memory_order_release);
+    g_SceneAlive.store(false, std::memory_order_release);
+}
+
+void MarkSceneAlive() {
+    g_LastSceneAliveMs.store(NowMs(), std::memory_order_release);
+    g_SceneAlive.store(true, std::memory_order_release);
+}
+
+bool IsSceneRenderAlive() {
+    if (!g_SceneAlive.load(std::memory_order_acquire)) return false;
+
+    long long lastAlive = g_LastSceneAliveMs.load(std::memory_order_acquire);
+    if (lastAlive <= 0 || NowMs() - lastAlive > 750) {
+        ClearSceneCaches();
+        return false;
+    }
+
+    return true;
+}
 
 // 函数指针类型定义
 #if defined(__aarch64__)
@@ -329,25 +508,28 @@ typedef void* (ARM64_CALL *GetBoneTransform_t)(void* animator, int boneId, void*
 GetBoneTransform_t Animator_GetBoneTransform = nullptr;
 // 【dump更新】Player.get_team不存在，team改为String字段通过偏移读取
 
-// 工具函数：检查Unity对象有效性
 bool m_CachedPtr(void *unity_obj) {
     if (!unity_obj) return false;
     if (!IsLikelyIl2CppObjectPointer(unity_obj)) return false;
 
     uintptr_t cachedPtr = 0;
-    try {
-        #if defined(__aarch64__)
-        cachedPtr = *(uintptr_t*)((uintptr_t)unity_obj + 0x10);
-        #else
-        cachedPtr = *(uintptr_t*)((uintptr_t)unity_obj + 0x8);
-        #endif
-    } catch (...) {
-        return false;
-    }
+    #if defined(__aarch64__)
+    if (!SafeRead64((void*)((uintptr_t)unity_obj + 0x10), &cachedPtr)) return false;
+    #else
+    if (!SafeRead64((void*)((uintptr_t)unity_obj + 0x8), &cachedPtr)) return false;
+    #endif
 
     if (!IsLikelyNativePointer((void*)cachedPtr)) return false;
+
+    // 【核心修复】：防止 GC 复用导致的“伪造原生指针”崩溃！
+    // 0x3000000039 这种垃圾值虽然通过了大小校验，但它是一块无法读取的无效内存。
+    // 使用 SafeRead64 探路，如果是假指针直接返回 false！
+    uintptr_t dummy = 0;
+    if (!SafeRead64((void*)cachedPtr, &dummy)) return false;
+
     return Object_IsNativeObjectAlive && Object_IsNativeObjectAlive(unity_obj, nullptr);
 }
+
 
 uintptr_t GetAnimatorOffset(bool isNpc) {
     return isNpc ? 0xB8 : 0x100; // NpcControl._anim / PlayerControl._anim
@@ -361,13 +543,22 @@ uintptr_t GetTeamOffset(bool isNpc) {
     return isNpc ? 0x38 : 0x50; // NpcControl.team / PlayerControl.team
 }
 
+bool IsLocalPlayerControl(void* player) {
+    if (!m_CachedPtr(player)) return false;
+
+    void* localCam = nullptr;
+    // PlayerControl.localCam = 0x240
+    return SafeReadObjectField(player, 0x240, &localCam) && m_CachedPtr(localCam);
+}
+
 void* GetAnimatorFromCharacter(void* character, bool isNpc) {
     if (!m_CachedPtr(character)) return nullptr;
 
-    try {
-        void* animator = *(void**)((uintptr_t)character + GetAnimatorOffset(isNpc));
-        if (m_CachedPtr(animator)) return animator;
-    } catch (...) {}
+    void* animator = nullptr;
+    if (SafeReadObjectField(character, GetAnimatorOffset(isNpc), &animator) &&
+        m_CachedPtr(animator)) {
+        return animator;
+    }
 
     return nullptr;
 }
@@ -375,15 +566,16 @@ void* GetAnimatorFromCharacter(void* character, bool isNpc) {
 // 安全获取武器开火位置（dump: Weapon.firePoint 字段位于 0x108）
 Vector3 Transform_getPosition(void *transform);
 Vector3 GetWeaponFirePoint(void* weapon) {
-    if (!weapon || !IsValidHeapPointer(weapon)) return Vector3::Zero();
+    if (!m_CachedPtr(weapon)) {
+        std::lock_guard<std::mutex> camLock(g_CameraMutex);
+        return g_CameraPosition;
+    }
 
-    try {
-        void* firePoint = *(void**)((uintptr_t)weapon + 0x108);
-        if (IsValidHeapPointer(firePoint) && m_CachedPtr(firePoint)) {
-            Vector3 pos = Transform_get_position(firePoint, nullptr);
-            if (pos != Vector3::Zero()) return pos;
-        }
-    } catch (...) {}
+    void* firePoint = nullptr;
+    if (SafeReadObjectField(weapon, 0x108, &firePoint) && m_CachedPtr(firePoint)) {
+        Vector3 pos = Transform_get_position(firePoint, nullptr);
+        if (pos != Vector3::Zero()) return pos;
+    }
 
     std::lock_guard<std::mutex> camLock(g_CameraMutex);
     return g_CameraPosition; 
@@ -429,14 +621,12 @@ void RestoreMotionCache(PlayerInfo& info, const std::vector<PlayerInfo>& previou
 Vector3 ReadCachedPlayerVelocity(const PlayerInfo& info) {
     if (!m_CachedPtr(info.playerPtr)) return Vector3::Zero();
 
-    try {
-        uintptr_t velOffset = info.isNpc ? 0xD0 : 0x208; // NpcControl.myRigidVel / PlayerControl.myRigidVel
-        Vector3 vel = *(Vector3*)((uintptr_t)info.playerPtr + velOffset);
-        if (!IsFiniteVector(vel)) return Vector3::Zero();
+    uintptr_t velOffset = info.isNpc ? 0xD0 : 0x208; // NpcControl.myRigidVel / PlayerControl.myRigidVel
+    Vector3 vel = Vector3::Zero();
+    if (!SafeReadVector3((void*)((uintptr_t)info.playerPtr + velOffset), &vel)) return Vector3::Zero();
 
-        float speed = Vector3::Magnitude(vel);
-        if (speed > 0.01f && speed < 80.0f) return vel;
-    } catch (...) {}
+    float speed = Vector3::Magnitude(vel);
+    if (speed > 0.01f && speed < 80.0f) return vel;
 
     return Vector3::Zero();
 }
@@ -445,15 +635,16 @@ float GetTrackingBulletSpeed(void* weapon) {
     const float trackSpeed = (float)kBulletTrackSpeed;
     float speed = trackSpeed;
 
-    if (!weapon || !IsValidHeapPointer(weapon)) return speed;
+    if (!m_CachedPtr(weapon)) return speed;
 
-    try {
-        int* bulletSpeedPtr = (int*)((uintptr_t)weapon + 0x3C); // Weapon.bulletSpeed
-        if (bulletSpeedPtr) {
-            if (*bulletSpeedPtr < (int)trackSpeed) *bulletSpeedPtr = (int)trackSpeed;
-            if (*bulletSpeedPtr > 0 && *bulletSpeedPtr < 20000) speed = (float)*bulletSpeedPtr;
+    int currentSpeed = 0;
+    if (SafeReadInt32((void*)((uintptr_t)weapon + 0x3C), &currentSpeed)) { // Weapon.bulletSpeed
+        if (currentSpeed < kBulletTrackSpeed) {
+            SafeWriteInt32Field(weapon, 0x3C, kBulletTrackSpeed);
+            currentSpeed = kBulletTrackSpeed;
         }
-    } catch (...) {}
+        if (currentSpeed > 0 && currentSpeed < 20000) speed = (float)currentSpeed;
+    }
 
     return speed;
 }
@@ -461,33 +652,32 @@ float GetTrackingBulletSpeed(void* weapon) {
 void ApplyTrackingWeaponStats(void* weapon) {
     if (!m_CachedPtr(weapon)) return;
 
-    try {
-        int* bulletSpeedPtr = (int*)((uintptr_t)weapon + 0x3C); // Weapon.bulletSpeed
-        if (bulletSpeedPtr && (*bulletSpeedPtr <= 0 || *bulletSpeedPtr < kBulletTrackSpeed)) {
-            *bulletSpeedPtr = kBulletTrackSpeed;
-        }
+    int currentSpeed = 0;
+    if (SafeReadInt32((void*)((uintptr_t)weapon + 0x3C), &currentSpeed) &&
+        (currentSpeed <= 0 || currentSpeed < kBulletTrackSpeed)) {
+        SafeWriteInt32Field(weapon, 0x3C, kBulletTrackSpeed);
+    }
 
-        int* rangePtr = (int*)((uintptr_t)weapon + 0x40); // Weapon.range
-        if (rangePtr && (*rangePtr <= 0 || *rangePtr < kBulletTrackRange)) {
-            *rangePtr = kBulletTrackRange;
-        }
-    } catch (...) {}
+    int currentRange = 0;
+    if (SafeReadInt32((void*)((uintptr_t)weapon + 0x40), &currentRange) &&
+        (currentRange <= 0 || currentRange < kBulletTrackRange)) {
+        SafeWriteInt32Field(weapon, 0x40, kBulletTrackRange);
+    }
 }
 
 void ApplyTrackingBulletStats(void* bullet) {
     if (!m_CachedPtr(bullet)) return;
 
-    try {
-        float* rangePtr = (float*)((uintptr_t)bullet + 0x1C);       // Bullet.range
-        float* traveledPtr = (float*)((uintptr_t)bullet + 0x20);    // Bullet.traveledDist
+    float currentRange = 0.0f;
+    if (SafeReadFloat((void*)((uintptr_t)bullet + 0x1C), &currentRange) &&
+        (currentRange <= 0.0f || currentRange < (float)kBulletTrackRange)) {
+        SafeWriteFloatField(bullet, 0x1C, (float)kBulletTrackRange);
+    }
 
-        if (rangePtr && (*rangePtr <= 0.0f || *rangePtr < (float)kBulletTrackRange)) {
-            *rangePtr = (float)kBulletTrackRange;
-        }
-        if (traveledPtr && *traveledPtr > 0.0f) {
-            *traveledPtr = 0.0f;
-        }
-    } catch (...) {}
+    float traveledDist = 0.0f;
+    if (SafeReadFloat((void*)((uintptr_t)bullet + 0x20), &traveledDist) && traveledDist > 0.0f) {
+        SafeWriteFloatField(bullet, 0x20, 0.0f);
+    }
 }
 
 float SolveInterceptTime(Vector3 firePoint, Vector3 targetPos, Vector3 targetVelocity, float bulletSpeed) {
@@ -515,8 +705,11 @@ float SolveInterceptTime(Vector3 firePoint, Vector3 targetPos, Vector3 targetVel
         }
     }
 
-    if (t <= 0.0f) t = sqrtf(c) / bulletSpeed;
-    return fminf(fmaxf(t, 0.0f), 1.25f);
+    float directTime = sqrtf(c) / bulletSpeed;
+    if (t <= 0.0f) t = directTime;
+
+    float maxPredictTime = fminf(fmaxf(directTime + 0.35f, 1.25f), 4.0f);
+    return fminf(fmaxf(t, 0.0f), maxPredictTime);
 }
 
 Vector3 GetPhysicsGravityVector() {
@@ -576,22 +769,39 @@ void DisableAllESP() {
 void ModifyWeapon(void* weapon) {
     if (!m_CachedPtr(weapon)) return;
     
-    try {
-        if (g_InfiniteAmmo) {
-            int* magPtr = (int*)((uintptr_t)weapon + 0xC8);  // Weapon.mag 偏移 (dump: 0xC8)
-            if (magPtr) *magPtr = 9999;
+    if (g_InfiniteAmmo) {
+        SafeWriteInt32Field(weapon, 0xC4, 9999); // Weapon.ammo
+        SafeWriteInt32Field(weapon, 0xC8, 9999); // Weapon.mag
+    }
+
+    if (g_NoRecoil) {
+        SafeWriteFloatField(weapon, 0xA8, 0.0f); // Weapon.forces.X
+        SafeWriteFloatField(weapon, 0xAC, 0.0f); // Weapon.forces.Y
+        SafeWriteFloatField(weapon, 0xB0, 0.0f); // Weapon.forces.Z
+
+        void* owner = nullptr;
+        if (SafeReadObjectField(weapon, 0x148, &owner) && m_CachedPtr(owner)) { // Weapon._player
+            SafeWriteFloatField(owner, 0x1E4, 0.0f); // PlayerControl.weaponKick.X
+            SafeWriteFloatField(owner, 0x1E8, 0.0f); // PlayerControl.weaponKick.Y
+            SafeWriteFloatField(owner, 0x1EC, 0.0f); // PlayerControl.weaponKick.Z
+            SafeWriteFloatField(owner, 0x1F0, 0.0f); // PlayerControl.swayZ
+            SafeWriteFloatField(owner, 0x1F8, 0.0f); // PlayerControl.recoilSpring.X
+            SafeWriteFloatField(owner, 0x1FC, 0.0f); // PlayerControl.recoilSpring.Y
+            SafeWriteFloatField(owner, 0x2A8, 0.0f); // PlayerControl.camShake
         }
-        if (g_NoRecoil) {
-            float* recoilForcePtr = (float*)((uintptr_t)weapon + 0xA8);  // Weapon.forces 偏移 (dump: 0xA8, Vector3)
-            if (recoilForcePtr) { recoilForcePtr[0] = 0.0f; recoilForcePtr[1] = 0.0f; recoilForcePtr[2] = 0.0f; }
-        }
-        if (g_HighDamage) {
-            int* bulletDamagePtr = (int*)((uintptr_t)weapon + 0x44);  // Weapon.damage 偏移 (dump: 0x44, int32)
-            if (bulletDamagePtr) *bulletDamagePtr = 999;
-        }
-        int* bulletSpeedPtr = (int*)((uintptr_t)weapon + 0x3C);  // Weapon.bulletSpeed 偏移 (dump: 0x3C, int32)
-        if (bulletSpeedPtr) *bulletSpeedPtr = (int)g_BulletSpeedValue;
-    } catch (...) {}
+    }
+
+    if (g_HighDamage) {
+        SafeWriteInt32Field(weapon, 0x44, 999); // Weapon.damage
+    }
+
+    if (g_NoFireCooldown) {
+        SafeWriteFloatField(weapon, 0x88, 0.0f); // Weapon.overHeat
+        SafeWriteBoolField(weapon, 0x8C, false); // Weapon.overHeated
+        SafeWriteFloatField(weapon, 0xB8, 0.0f); // Weapon.fireCoolDown
+    }
+
+    SafeWriteInt32Field(weapon, 0x3C, (int)g_BulletSpeedValue); // Weapon.bulletSpeed
 }
 
 // 移动速度修改
@@ -760,21 +970,21 @@ void* FindCharacterFromCollision(void* collision, bool* outIsNpc) {
     return nullptr;
 }
 
-// Bullet.OnCollisionEnter Hook（追踪开启时忽略墙体/掩体，只把角色碰撞交给原函数结算）
 void Hooked_BulletOnCollisionEnter(void* bullet, void* collision, void* method) {
     if (g_BulletTrackEnabled) {
         bool hitIsNpc = false;
         void* hitCharacter = FindCharacterFromCollision(collision, &hitIsNpc);
-        if (!hitCharacter) {
-            return;
-        }
-
-        int hitTeam = SafeReadTeamHash(hitCharacter, GetTeamOffset(hitIsNpc));
-        if (IsTeammate(hitTeam)) {
-            return;
+        
+        // 只有在明确打中实体，且该实体是队友时，才拦截判定（实现子弹穿透队友）
+        if (hitCharacter) {
+            int hitTeam = SafeReadTeamHash(hitCharacter, GetTeamOffset(hitIsNpc));
+            if (IsTeammate(hitTeam)) {
+                return; // 直接返回，吞掉伤害判定
+            }
         }
     }
 
+    // 如果打中的是敌人，或者是墙壁掩体，都必须走原版结算！
     if (old_BulletOnCollisionEnter) {
         old_BulletOnCollisionEnter(bullet, collision, method);
     }
@@ -819,7 +1029,7 @@ void ShowModSubMenu() {
     ImGui::Checkbox("启用子弹追踪", &g_BulletTrackEnabled);
     if (g_BulletTrackEnabled) {
         ImGui::Indent(15);
-        ImGui::SliderFloat("最大追踪距离", &g_BulletTrackMaxDist, 50.0f, 500.0f, "%.0fm");
+        ImGui::SliderFloat("最大追踪距离", &g_BulletTrackMaxDist, 50.0f, 2000.0f, "%.0fm");
         ImGui::Checkbox("追踪头部（否则躯干）", &g_BulletTrackLockHead);
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.8f, 0.8f, 1.0f, 1.0f), "🎯 追踪模式");
@@ -828,7 +1038,7 @@ void ShowModSubMenu() {
         ImGui::Separator();
         ImGui::Checkbox("显示追踪范围圈", &g_ShowTrackRange);
         if (g_ShowTrackRange) {
-            ImGui::SliderFloat("圆圈大小", &g_TrackCircleRadius, 30.0f, 300.0f, "%.0fpx");
+            ImGui::SliderFloat("圆圈大小", &g_TrackCircleRadius, 30.0f, 600.0f, "%.0fpx");
         }
         ImGui::Unindent(15);
     }
@@ -843,6 +1053,7 @@ void ShowModSubMenu() {
         ImGui::Checkbox("无限子弹", &g_InfiniteAmmo);
         ImGui::Checkbox("无后坐力", &g_NoRecoil);
         ImGui::Checkbox("高伤害", &g_HighDamage);
+        ImGui::Checkbox("无限制开火（无过热/冷却）", &g_NoFireCooldown);
         ImGui::SliderFloat("子弹速度", &g_BulletSpeedValue, 100.0f, 2000.0f, "%.0f");
         ImGui::InputInt("瞄准范围（固定）", &g_CanScopeValue, 0, 0);
         ImGui::TextDisabled("（按要求固定为50，不可修改）");
@@ -916,16 +1127,12 @@ void GetPlayerHealthInfo(void* player, bool isNpc, float& currentHealth, float& 
     
     if (!m_CachedPtr(player)) return;
     
-    try {
-        int* healthPtr = (int*)((uintptr_t)player + GetHealthOffset(isNpc));
-        if (healthPtr && *healthPtr > 0 && *healthPtr <= 10000) {
-            currentHealth = (float)*healthPtr;
-            maxHealth = 1000.0f;
-            return;
-        }
-    } catch (...) {
-        currentHealth = 0.0f;
-        maxHealth = 100.0f;
+    int health = 0;
+    if (SafeReadInt32((void*)((uintptr_t)player + GetHealthOffset(isNpc)), &health) &&
+        health > 0 && health <= 10000) {
+        currentHealth = (float)health;
+        maxHealth = 1000.0f;
+        return;
     }
     
     if (currentHealth <= 0) {
@@ -939,58 +1146,48 @@ int GetPlayerTeamId(void* player) {
     return SafeReadTeamHash(player, GetTeamOffset(false));
 }
 
-// 检查是否为队友（简化版：在RefreshPlayerList中已过滤本地玩家）
+// 检查是否为队友：只读主线程刷新出的本地队伍缓存，绘制线程禁止调用 Unity API。
 bool IsTeammate(int playerTeamId) {
     if (!isTeamFilter) return false;
-    
-    // 获取本地玩家team哈希（缓存）
-    static int localTeamHash = -2;  // -2 = 未初始化, -1 = 获取失败
-    if (localTeamHash == -2) {
-        localTeamHash = -1;
-        void* playerType = Type_GetTypeName(Il2CppString::CreateMonoString("PlayerControl,Assembly-CSharp.dll"), nullptr);
-        if (playerType) {
-            MonoArray<void**>* players = Object_FindObjectsOfType(playerType, nullptr);
-            if (players && players->getLength() > 0) {
-                for (int i = 0; i < players->getLength(); i++) {
-                    void* p = players->getPointer()[i];
-                    if (!m_CachedPtr(p)) continue;
-                    int teamHash = SafeReadTeamHash(p, GetTeamOffset(false));
-                    if (teamHash >= 0) {
-                        localTeamHash = teamHash;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+
+    int localTeamHash = g_LocalTeamHash.load(std::memory_order_acquire);
     if (localTeamHash < 0) return false;
+    if (playerTeamId < 0) return false;
     return playerTeamId == localTeamHash;
 }
 
 // 【修复】playersList/get_type不再需要，RefreshPlayerList内部直接获取类型
 void *camera = nullptr;
 
-// 安全读取MonoString（防止读非指针数据崩溃）
-// 传入确定的偏移量，并使用严格的指针校验
+
+// 传入确定的偏移量，并使用严格的指针校验和纯内存数据提取
 int SafeReadTeamHash(void* obj, int teamOffset) {
     if (!m_CachedPtr(obj)) return -1;
     
-    try {
-        // 读取指定偏移的指针。调用方必须传入准确的 NpcControl/PlayerControl 偏移。
-        void* strPtr = *(void**)((uintptr_t)obj + teamOffset);
-        if (!IsLikelyIl2CppObjectPointer(strPtr)) return -1;
+    void* strPtr = nullptr;
+    if (!SafeReadObjectField(obj, (uintptr_t)teamOffset, &strPtr)) return -1;
 
-        MonoString* str = (MonoString*)strPtr;
-        int len = str->getLength();
-        if (len > 0 && len < 64) {
-            return std::hash<std::string>{}(str->ToString()) % 10000;
+    uintptr_t len64 = 0;
+    if (!SafeRead64((void*)((uintptr_t)strPtr + 0x10), &len64)) return -1;
+    
+    // 取低 32 位作为字符串真实长度
+    int len = (int)(len64 & 0xFFFFFFFF); 
+    
+    // 长度合法（1 到 32 字符），直接读取底层的 UTF-16 数据流做 Hash
+    if (len > 0 && len < 32) {
+        uintptr_t charsData = 0;
+        // MonoString 实际字符数据存储在 +0x14 偏移处
+        if (SafeRead64((void*)((uintptr_t)strPtr + 0x14), &charsData)) {
+            // 将前 4 个 UTF-16 字符（8 字节）进行异或计算，生成极度安全的队伍 Hash！
+            // 彻底告别 str->ToString() 带来的隐藏引擎级崩溃。
+            return (int)((charsData ^ (charsData >> 16)) % 10000);
         }
-    } catch (...) {}
+    }
     
     return -1;
 }
 
-// 刷新玩家列表（安全版）
+
 // 刷新玩家列表与坐标同步（全新优化主线程版）
 void RefreshPlayerList(bool forceRefreshEntities) {
     static int frameCount = 0;
@@ -1032,13 +1229,25 @@ void RefreshPlayerList(bool forceRefreshEntities) {
             if (playerType) {
                 MonoArray<void**>* playerList = Object_FindObjectsOfType(playerType, nullptr);
                 if (playerList && playerList->getLength() > 0) {
-                    static int localTeamHash = -2;
+                    int localTeamHash = -1;
+                    for (int i = 0; i < playerList->getLength(); i++) {
+                        void* obj = playerList->getPointer()[i];
+                        if (!m_CachedPtr(obj) || !IsLocalPlayerControl(obj)) continue;
+
+                        int teamHash = SafeReadTeamHash(obj, GetTeamOffset(false));
+                        if (teamHash >= 0) {
+                            localTeamHash = teamHash;
+                            break;
+                        }
+                    }
+                    g_LocalTeamHash.store(localTeamHash, std::memory_order_release);
+
                     for (int i = 0; i < playerList->getLength(); i++) {
                         void* obj = playerList->getPointer()[i];
                         if (!m_CachedPtr(obj)) continue;
                         int teamHash = SafeReadTeamHash(obj, GetTeamOffset(false));
-                        if (localTeamHash == -2 && teamHash >= 0) { localTeamHash = teamHash; continue; }
-                        if (teamHash == localTeamHash && isTeamFilter) continue;
+                        if (IsLocalPlayerControl(obj)) continue;
+                        if (localTeamHash >= 0 && teamHash == localTeamHash && isTeamFilter) continue;
                         PlayerInfo info;
                         info.playerPtr = obj;
                         info.isNpc = false;
@@ -1255,10 +1464,35 @@ void SyncESPDataOnMainThread() {
 
 // Update函数（主线程帧回调）
 void Update(void * instance, void* method) {
+    void* cam = nullptr;
+    if (Camera_get_main) {
+        try {
+            cam = Camera_get_main(nullptr);
+        } catch (...) {
+            cam = nullptr;
+        }
+    }
+
+    if (!m_CachedPtr(cam)) {
+        ClearSceneCaches();
+        if (old_Update) old_Update(instance, method);
+        return;
+    }
+
+    bool sceneChanged = false;
+    uintptr_t camPtr = (uintptr_t)cam;
+    uintptr_t lastCamPtr = g_LastMainCameraPtr.load(std::memory_order_acquire);
+    if (lastCamPtr != camPtr) {
+        ClearSceneCaches();
+        g_LastMainCameraPtr.store(camPtr, std::memory_order_release);
+        sceneChanged = true;
+    }
+
+    MarkSceneAlive();
 
     if (isESP || g_BulletTrackEnabled) {
         static bool firstUpdate = true;
-        if (firstUpdate) {
+        if (firstUpdate || sceneChanged) {
             RefreshPlayerList(true);
             firstUpdate = false;
         } else {
@@ -1300,7 +1534,7 @@ void Update(void * instance, void* method) {
     }
 
     // 调用原函数
-  if (old_Update) old_Update(instance, method);
+    if (old_Update) old_Update(instance, method);
 }
 
 // 绘制血量条
@@ -1379,6 +1613,7 @@ void DrawHealthBar(ImDrawList* draw, const Rect& playerRect, float currentHealth
 void DrawESP(ImDrawList *draw, int screenWidth, int screenHeight) {
     std::lock_guard<std::mutex> guard(drawMutex);
     if (!bInitDone) return;
+    if (!IsSceneRenderAlive()) return;
 
     try {
         {
@@ -1587,7 +1822,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         ShowMenu();
 
         // 子弹追踪范围圈（白色圆圈在屏幕中心）
-        if (g_BulletTrackEnabled && g_ShowTrackRange) {
+        if (g_BulletTrackEnabled && g_ShowTrackRange && IsSceneRenderAlive()) {
             ImVec2 center(glWidth / 2.0f, glHeight / 2.0f);
             ImGui::GetBackgroundDrawList()->AddCircle(
                 center, g_TrackCircleRadius, ImColor(255, 255, 255, 180), 64, 2.0f);
