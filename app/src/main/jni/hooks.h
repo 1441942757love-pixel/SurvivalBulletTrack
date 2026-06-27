@@ -89,24 +89,24 @@ int hook_getWidth(ANativeWindow* window);
 int (*old_getHeight)(ANativeWindow* window);
 int hook_getHeight(ANativeWindow* window);
 void Egl_hooks();
-void (*old_Update)(void * Update) = nullptr;
-void Update(void * Update);
+void (*old_Update)(void * Update, void* method) = nullptr;
+void Update(void * Update, void* method);
 void ShowMenu();
 bool IsTeammate(int playerTeamId);
 struct PlayerInfo;
 PlayerInfo FindClosestTarget(Vector3 origin);
 
-	// FireBullet Hook（IL2CPP传递Vector3(>8字节)用指针引用，非按值！）
-    typedef void (ARM64_CALL *FireBullet_t)(void* weapon, Vector3* _shootDir);
+	// FireBullet Hook（dump: FireBullet(UnityEngine.Vector3 _shootDir)）
+    typedef void (ARM64_CALL *FireBullet_t)(void* weapon, Vector3 _shootDir, void* method);
     FireBullet_t old_FireBullet = nullptr;
     FireBullet_t old_NpcFireBullet = nullptr;
     // Bullet Hook
-    typedef void (ARM64_CALL *BulletOnEnable_t)(void* bullet);
+    typedef void (ARM64_CALL *BulletOnEnable_t)(void* bullet, void* method);
     BulletOnEnable_t old_BulletOnEnable = nullptr;
-    void Hooked_BulletOnEnable(void* bullet);
-    typedef void (ARM64_CALL *BulletOnCollision_t)(void* bullet, void* collision);
+    void Hooked_BulletOnEnable(void* bullet, void* method);
+    typedef void (ARM64_CALL *BulletOnCollision_t)(void* bullet, void* collision, void* method);
     BulletOnCollision_t old_BulletOnCollisionEnter = nullptr;
-    void Hooked_BulletOnCollisionEnter(void* bullet, void* collision);
+    void Hooked_BulletOnCollisionEnter(void* bullet, void* collision, void* method);
 void initializeFunctionPointers();
 void restartDrawing();
 void ModifyWeapon(void* weapon);
@@ -115,8 +115,9 @@ void ModifyMoveSpeed(void* moveBehaviour);
 void ModifyPlayerHealth(void* healthManager);
 void ShowDrawSubMenu();
 void ShowModSubMenu();
-void GetPlayerHealthInfo(void* player, float& currentHealth, float& maxHealth);
+void GetPlayerHealthInfo(void* player, bool isNpc, float& currentHealth, float& maxHealth);
 int GetPlayerTeamId(void* player);
+int SafeReadTeamHash(void* obj, int teamOffset);
 void DrawHealthBar(ImDrawList* draw, const Rect& playerRect, float currentHealth, float maxHealth, float distance, int screenWidth);
 void DrawESP(ImDrawList *draw, int screenWidth, int screenHeight);
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface);
@@ -124,7 +125,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
 void *hack_thread(void *);
 
 #define SAFE_CALL(instance, func, ...) \
-    if ((instance) && m_CachedPtr(instance) && Object_IsNativeObjectAlive(instance)) { \
+    if ((instance) && m_CachedPtr(instance) && Object_IsNativeObjectAlive(instance, nullptr)) { \
         func(instance, ##__VA_ARGS__); \
     }
 
@@ -138,6 +139,11 @@ struct PlayerInfo {
     float maxHealth;
     int team;
     float distance;
+    bool isNpc = false;
+    bool hasLastPosition = false;
+    Vector3 lastPosition = Vector3::Zero();
+    Vector3 lastHeadPos = Vector3::Zero();
+    Vector3 velocity = Vector3::Zero();
     // 【修复】预计算屏幕坐标（后台线程计算，GL线程只读，避免GL线程调用Unity API崩溃）
     ImVec2 screenFootPos = ImVec2(0,0);
     ImVec2 screenHeadPos = ImVec2(0,0);
@@ -231,6 +237,21 @@ bool IsValidHeapPointer(void* ptr) {
     return addr > 0x1000000000 && addr < 0x00007FFFFFFFFFFF; 
 }
 
+bool IsLikelyIl2CppObjectPointer(void* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    if (addr == 0) return false;
+    // 常见 arm64 用户态/托管堆地址；过滤 0x3500000001 / 0x0030003300000002 这类打包值伪指针。
+    return (addr >= 0x6000000000ULL && addr < 0x8000000000ULL) ||
+           (addr >= 0xB000000000000000ULL && addr < 0xC000000000000000ULL);
+}
+
+bool IsLikelyNativePointer(void* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    if (addr == 0) return false;
+    // UnityEngine.Object.m_CachedPtr 是 native 指针，通常在低 canonical 用户态地址，不是托管堆地址。
+    return addr >= 0x10000ULL && addr < 0x0000800000000000ULL;
+}
+
 ThreadPool pool(5);
 void* g_GhostAIObject = nullptr;
 void* g_AnimatorComponent = nullptr;
@@ -243,6 +264,8 @@ bool g_NoRecoil = false;
 bool g_HighDamage = false;
 float g_BulletSpeedValue = 500.0f;
 int g_CanScopeValue = 50;
+const int kBulletTrackSpeed = 5000;
+const int kBulletTrackRange = 2000;
 
 bool g_MoveSpeedModEnabled = false;
 float g_WalkSpeedValue = 10.0f;   
@@ -271,85 +294,258 @@ std::mutex g_WeaponMutex;
 
 // 函数指针类型定义
 #if defined(__aarch64__)
-typedef Vector3 (ARM64_CALL *Camera_WorldToScreen_t)(void *camera, Vector3 position);
-typedef void* (ARM64_CALL *GetTypeFunc_t)(MonoString*);
-typedef MonoArray<void**>* (ARM64_CALL *FindObjectsFunc_t)(void*);
+typedef Vector3 (ARM64_CALL *Camera_WorldToScreen_t)(void *camera, Vector3 position, void* method);
+typedef void* (ARM64_CALL *GetTypeFunc_t)(MonoString*, void* method);
+typedef MonoArray<void**>* (ARM64_CALL *FindObjectsFunc_t)(void*, void* method);
 #else
-typedef Vector3 (*Camera_WorldToScreen_t)(void *camera, Vector3 position);
-typedef void* (*GetTypeFunc_t)(MonoString*);
-typedef MonoArray<void**>* (*FindObjectsFunc_t)(void*);
+typedef Vector3 (*Camera_WorldToScreen_t)(void *camera, Vector3 position, void* method);
+typedef void* (*GetTypeFunc_t)(MonoString*, void* method);
+typedef MonoArray<void**>* (*FindObjectsFunc_t)(void*, void* method);
 #endif
 
-typedef MonoString* (*Object_get_name_t)(void*);
+typedef MonoString* (*Object_get_name_t)(void*, void* method);
 Object_get_name_t Object_get_name = nullptr;
-void (ARM64_CALL *Screen_SetResolution)(int width, int height, bool fullscreen);
+void (ARM64_CALL *Screen_SetResolution)(int width, int height, bool fullscreen, void* method);
 // 【dump更新】CameraManager类不存在，使用Camera.get_main即可
-void* (ARM64_CALL *Camera_get_main)();
-void* (ARM64_CALL *Component_get_transform)(void *instance);
-Vector3 (ARM64_CALL *Transform_get_position)(void *instance);
-	void (ARM64_CALL *Transform_set_position)(void *instance, Vector3 pos);
-void* (ARM64_CALL *GameObject_get_transform)(void *instance);
+void* (ARM64_CALL *Camera_get_main)(void* method);
+void* (ARM64_CALL *Component_get_transform)(void *instance, void* method);
+Vector3 (ARM64_CALL *Transform_get_position)(void *instance, void* method);
+void (ARM64_CALL *Transform_set_position)(void *instance, Vector3 pos, void* method);
+void* (ARM64_CALL *GameObject_get_transform)(void *instance, void* method);
 Camera_WorldToScreen_t Camera_WorldToScreen = nullptr;
 FindObjectsFunc_t Object_FindObjectsOfType = nullptr;
 GetTypeFunc_t Type_GetTypeName = nullptr;
-MonoArray<void**>* (ARM64_CALL *GameObject_FindGameObjectsWithTag)(MonoString*);
-bool* (ARM64_CALL *Object_IsNativeObjectAlive)(void *object);
-void* (ARM64_CALL *GameObject_get_gameObject)(void *original);
-void* (ARM64_CALL *Object_Destroy)(void* obj);
+MonoArray<void**>* (ARM64_CALL *GameObject_FindGameObjectsWithTag)(MonoString*, void* method);
+bool* (ARM64_CALL *Object_IsNativeObjectAlive)(void *object, void* method);
+void* (ARM64_CALL *GameObject_get_gameObject)(void *original, void* method);
+void* (ARM64_CALL *Object_Destroy)(void* obj, void* method);
+Vector3 (ARM64_CALL *Physics_get_gravity)(void* method);
 
 // 【dump更新】Player类不存在，health是NpcControl/PlayerControl的int32字段
-void* (ARM64_CALL *Component_GetComponent)(void* component, void* type);
-typedef void* (ARM64_CALL *GetBoneTransform_t)(void* animator, int boneId);
+void* (ARM64_CALL *Component_GetComponent)(void* component, void* type, void* method);
+void* (ARM64_CALL *Component_GetComponentInParent)(void* component, void* type, void* method);
+void* (ARM64_CALL *Collision_get_collider)(void* collision, void* method);
+typedef void* (ARM64_CALL *GetBoneTransform_t)(void* animator, int boneId, void* method);
 GetBoneTransform_t Animator_GetBoneTransform = nullptr;
 // 【dump更新】Player.get_team不存在，team改为String字段通过偏移读取
 
 // 工具函数：检查Unity对象有效性
 bool m_CachedPtr(void *unity_obj) {
     if (!unity_obj) return false;
-    #if defined(__aarch64__)
-    return (*(uintptr_t*)((uintptr_t)unity_obj + 0x10) != 0) && Object_IsNativeObjectAlive(unity_obj);
-    #else
-    return (*(uintptr_t*)((uintptr_t)unity_obj + 0x8) != 0) && Object_IsNativeObjectAlive(unity_obj);
-    #endif
+    if (!IsLikelyIl2CppObjectPointer(unity_obj)) return false;
+
+    uintptr_t cachedPtr = 0;
+    try {
+        #if defined(__aarch64__)
+        cachedPtr = *(uintptr_t*)((uintptr_t)unity_obj + 0x10);
+        #else
+        cachedPtr = *(uintptr_t*)((uintptr_t)unity_obj + 0x8);
+        #endif
+    } catch (...) {
+        return false;
+    }
+
+    if (!IsLikelyNativePointer((void*)cachedPtr)) return false;
+    return Object_IsNativeObjectAlive && Object_IsNativeObjectAlive(unity_obj, nullptr);
 }
 
-// 安全获取武器开火位置（dump更新：Weapon.firePoint 字段位于 0x108）
-// 安全获取武器开火位置（终极防崩溃版）
+uintptr_t GetAnimatorOffset(bool isNpc) {
+    return isNpc ? 0xB8 : 0x100; // NpcControl._anim / PlayerControl._anim
+}
+
+uintptr_t GetHealthOffset(bool isNpc) {
+    return isNpc ? 0x48 : 0x38; // NpcControl.health / PlayerControl.health
+}
+
+uintptr_t GetTeamOffset(bool isNpc) {
+    return isNpc ? 0x38 : 0x50; // NpcControl.team / PlayerControl.team
+}
+
+void* GetAnimatorFromCharacter(void* character, bool isNpc) {
+    if (!m_CachedPtr(character)) return nullptr;
+
+    try {
+        void* animator = *(void**)((uintptr_t)character + GetAnimatorOffset(isNpc));
+        if (m_CachedPtr(animator)) return animator;
+    } catch (...) {}
+
+    return nullptr;
+}
+
+// 安全获取武器开火位置（dump: Weapon.firePoint 字段位于 0x108）
 Vector3 Transform_getPosition(void *transform);
-// 安全获取武器开火位置（带严格内存隔离检查）
 Vector3 GetWeaponFirePoint(void* weapon) {
     if (!weapon || !IsValidHeapPointer(weapon)) return Vector3::Zero();
 
-    // 你的 dump 可能是 0x108 或 0x158，我们安全地挨个试
-    uintptr_t offsets[] = { 0x158, 0x108 }; 
-    for (int i = 0; i < 2; i++) {
-        try {
-            void* firePoint = *(void**)((uintptr_t)weapon + offsets[i]);
-            if (IsValidHeapPointer(firePoint) && m_CachedPtr(firePoint)) {
-                // 如果是个合法指针，拿它的坐标
-                Vector3 pos = Transform_getPosition(firePoint);
-                if (pos != Vector3::Zero()) return pos;
-            }
-        } catch (...) {}
-    }
+    try {
+        void* firePoint = *(void**)((uintptr_t)weapon + 0x108);
+        if (IsValidHeapPointer(firePoint) && m_CachedPtr(firePoint)) {
+            Vector3 pos = Transform_get_position(firePoint, nullptr);
+            if (pos != Vector3::Zero()) return pos;
+        }
+    } catch (...) {}
 
-    // 终极备用方案：如果全拿不到，直接拿玩家摄像机坐标当枪口（完全不影响自瞄！）
     std::lock_guard<std::mutex> camLock(g_CameraMutex);
     return g_CameraPosition; 
 }
 
 Vector3 Transform_getPosition(void *transform) {  
     if (!m_CachedPtr(transform)) return Vector3::Zero();
-    void* componentTransform = Component_get_transform(transform);
+    void* componentTransform = Component_get_transform(transform, nullptr);
     if (!m_CachedPtr(componentTransform)) return Vector3::Zero();
-    return Transform_get_position(componentTransform);
+    return Transform_get_position(componentTransform, nullptr);
 } 
 
 Vector3 GameObject_getPosition(void *transform) {  
     if (!m_CachedPtr(transform)) return Vector3::Zero();
-    void* gameObjectTransform = GameObject_get_transform(transform);
+    void* gameObjectTransform = GameObject_get_transform(transform, nullptr);
     if (!m_CachedPtr(gameObjectTransform)) return Vector3::Zero();
-    return Transform_get_position(gameObjectTransform);
+    return Transform_get_position(gameObjectTransform, nullptr);
+}
+
+bool IsFiniteVector(const Vector3& v) {
+    return std::isfinite(v.X) && std::isfinite(v.Y) && std::isfinite(v.Z);
+}
+
+Vector3 ClampVectorMagnitude(Vector3 v, float maxMagnitude) {
+    float mag = Vector3::Magnitude(v);
+    if (mag <= maxMagnitude || mag <= 0.001f) return v;
+    return v * (maxMagnitude / mag);
+}
+
+void RestoreMotionCache(PlayerInfo& info, const std::vector<PlayerInfo>& previousPlayers) {
+    for (const auto& oldInfo : previousPlayers) {
+        if (oldInfo.playerPtr != info.playerPtr) continue;
+        info.position = oldInfo.position;
+        info.headPos = oldInfo.headPos;
+        info.lastPosition = oldInfo.lastPosition;
+        info.lastHeadPos = oldInfo.lastHeadPos;
+        info.velocity = oldInfo.velocity;
+        info.hasLastPosition = oldInfo.hasLastPosition;
+        return;
+    }
+}
+
+Vector3 ReadCachedPlayerVelocity(const PlayerInfo& info) {
+    if (!m_CachedPtr(info.playerPtr)) return Vector3::Zero();
+
+    try {
+        uintptr_t velOffset = info.isNpc ? 0xD0 : 0x208; // NpcControl.myRigidVel / PlayerControl.myRigidVel
+        Vector3 vel = *(Vector3*)((uintptr_t)info.playerPtr + velOffset);
+        if (!IsFiniteVector(vel)) return Vector3::Zero();
+
+        float speed = Vector3::Magnitude(vel);
+        if (speed > 0.01f && speed < 80.0f) return vel;
+    } catch (...) {}
+
+    return Vector3::Zero();
+}
+
+float GetTrackingBulletSpeed(void* weapon) {
+    const float trackSpeed = (float)kBulletTrackSpeed;
+    float speed = trackSpeed;
+
+    if (!weapon || !IsValidHeapPointer(weapon)) return speed;
+
+    try {
+        int* bulletSpeedPtr = (int*)((uintptr_t)weapon + 0x3C); // Weapon.bulletSpeed
+        if (bulletSpeedPtr) {
+            if (*bulletSpeedPtr < (int)trackSpeed) *bulletSpeedPtr = (int)trackSpeed;
+            if (*bulletSpeedPtr > 0 && *bulletSpeedPtr < 20000) speed = (float)*bulletSpeedPtr;
+        }
+    } catch (...) {}
+
+    return speed;
+}
+
+void ApplyTrackingWeaponStats(void* weapon) {
+    if (!m_CachedPtr(weapon)) return;
+
+    try {
+        int* bulletSpeedPtr = (int*)((uintptr_t)weapon + 0x3C); // Weapon.bulletSpeed
+        if (bulletSpeedPtr && (*bulletSpeedPtr <= 0 || *bulletSpeedPtr < kBulletTrackSpeed)) {
+            *bulletSpeedPtr = kBulletTrackSpeed;
+        }
+
+        int* rangePtr = (int*)((uintptr_t)weapon + 0x40); // Weapon.range
+        if (rangePtr && (*rangePtr <= 0 || *rangePtr < kBulletTrackRange)) {
+            *rangePtr = kBulletTrackRange;
+        }
+    } catch (...) {}
+}
+
+void ApplyTrackingBulletStats(void* bullet) {
+    if (!m_CachedPtr(bullet)) return;
+
+    try {
+        float* rangePtr = (float*)((uintptr_t)bullet + 0x1C);       // Bullet.range
+        float* traveledPtr = (float*)((uintptr_t)bullet + 0x20);    // Bullet.traveledDist
+
+        if (rangePtr && (*rangePtr <= 0.0f || *rangePtr < (float)kBulletTrackRange)) {
+            *rangePtr = (float)kBulletTrackRange;
+        }
+        if (traveledPtr && *traveledPtr > 0.0f) {
+            *traveledPtr = 0.0f;
+        }
+    } catch (...) {}
+}
+
+float SolveInterceptTime(Vector3 firePoint, Vector3 targetPos, Vector3 targetVelocity, float bulletSpeed) {
+    if (bulletSpeed <= 1.0f) return 0.0f;
+
+    Vector3 toTarget = targetPos - firePoint;
+    float c = Vector3::Dot(toTarget, toTarget);
+    if (c <= 0.001f) return 0.0f;
+
+    float a = Vector3::Dot(targetVelocity, targetVelocity) - bulletSpeed * bulletSpeed;
+    float b = 2.0f * Vector3::Dot(toTarget, targetVelocity);
+    float t = 0.0f;
+
+    if (fabsf(a) < 0.001f) {
+        if (fabsf(b) > 0.001f) t = -c / b;
+    } else {
+        float discriminant = b * b - 4.0f * a * c;
+        if (discriminant >= 0.0f) {
+            float root = sqrtf(discriminant);
+            float t1 = (-b - root) / (2.0f * a);
+            float t2 = (-b + root) / (2.0f * a);
+            if (t1 > 0.0f && t2 > 0.0f) t = fminf(t1, t2);
+            else if (t1 > 0.0f) t = t1;
+            else if (t2 > 0.0f) t = t2;
+        }
+    }
+
+    if (t <= 0.0f) t = sqrtf(c) / bulletSpeed;
+    return fminf(fmaxf(t, 0.0f), 1.25f);
+}
+
+Vector3 GetPhysicsGravityVector() {
+    Vector3 gravity = Vector3(0.0f, -9.81f, 0.0f);
+
+    try {
+        if (Physics_get_gravity) {
+            Vector3 runtimeGravity = Physics_get_gravity(nullptr);
+            if (IsFiniteVector(runtimeGravity) && Vector3::Magnitude(runtimeGravity) > 0.001f) {
+                gravity = runtimeGravity;
+            }
+        }
+    } catch (...) {}
+
+    return gravity;
+}
+
+Vector3 PredictAimPoint(Vector3 firePoint, const PlayerInfo& target, float bulletSpeed) {
+    Vector3 targetPos = target.headPos;
+    if (!g_BulletTrackLockHead) targetPos.Y -= 0.5f;
+
+    Vector3 targetVelocity = ClampVectorMagnitude(target.velocity, 60.0f);
+    float interceptTime = SolveInterceptTime(firePoint, targetPos, targetVelocity, bulletSpeed);
+    Vector3 predicted = targetPos + targetVelocity * interceptTime;
+    Vector3 gravity = GetPhysicsGravityVector();
+    predicted = predicted - gravity * (0.5f * interceptTime * interceptTime);
+
+    if (!IsFiniteVector(predicted)) return targetPos;
+    return predicted;
 }
 
 void EnableAllESP() {
@@ -437,7 +633,7 @@ PlayerInfo FindClosestTarget(Vector3 origin) {
 
     std::lock_guard<std::mutex> lock(g_PlayersInfoMutex);
     for (const auto& info : g_PlayersInfo) {
-        if (!m_CachedPtr(info.playerPtr) || IsTeammate(info.team)) {
+        if (!info.playerPtr || IsTeammate(info.team)) {
             continue;
         }
         Vector3 tp = (info.headPos != Vector3::Zero()) ? info.headPos : (info.position + Vector3(0, 1.6f, 0));
@@ -463,7 +659,7 @@ PlayerInfo FindCrosshairTarget() {
     ImVec2 screenCenter(Game_Screen::Width / 2.0f, Game_Screen::Height / 2.0f);
 
     for (const auto& info : g_PlayersInfo) {
-        if (!m_CachedPtr(info.playerPtr) || IsTeammate(info.team)) continue;
+        if (!info.playerPtr || IsTeammate(info.team)) continue;
         
         // 如果不在屏幕内（没有预计算深度），直接跳过
         if (info.screenDepth <= 0.f) continue;
@@ -473,72 +669,114 @@ PlayerInfo FindCrosshairTarget() {
         
         float screenDist = sqrtf((screenPos.x - screenCenter.x) * (screenPos.x - screenCenter.x) +
                                   (screenPos.y - screenCenter.y) * (screenPos.y - screenCenter.y));
+        if (screenDist > g_TrackCircleRadius) continue;
         if (screenDist < closest.distance) {
+            closest = info;
             closest.distance = screenDist;
-            closest.playerPtr = info.playerPtr;
-            closest.headPos = info.headPos;
-            closest.position = info.position;
-            closest.team = info.team;
-            closest.name = info.name;
         }
     }
     return closest;
 }
 
-// 子弹追踪Hook（dump更新：FireBullet只接受方向向量，改为修改_shootDir）
-
-// 子弹追踪Hook（不调用 old_FireBullet！修改 *_shootDir 后由 Dobby 自动执行原函数）
-void Hooked_FireBullet(void* weapon, Vector3* _shootDir) {
-    // 追踪关闭或无有效目标时直接返回，Dobby执行原始函数
-    if (!g_BulletTrackEnabled || !_shootDir || !m_CachedPtr(weapon)) return;
+// 子弹追踪Hook（dump: FireBullet(Vector3 _shootDir)，按值接收后显式调用原函数）
+void Hooked_FireBullet(void* weapon, Vector3 _shootDir, void* method) {
+    Vector3 finalShootDir = _shootDir;
 
     try {
-        Vector3 firePoint;
-        {
-            std::lock_guard<std::mutex> camLock(g_CameraMutex);
-            firePoint = g_CameraPosition;
-        }
+        if (g_BulletTrackEnabled && m_CachedPtr(weapon)) {
+            ApplyTrackingWeaponStats(weapon);
+            Vector3 firePoint = GetWeaponFirePoint(weapon);
 
-        if (firePoint != Vector3::Zero()) {
-            PlayerInfo target;
-            if (g_BulletTrackMode == 1) {
-                target = FindCrosshairTarget();
-            } else {
-                target = FindClosestTarget(firePoint);
-            }
+            if (firePoint != Vector3::Zero()) {
+                PlayerInfo target;
+                if (g_BulletTrackMode == 1) {
+                    target = FindCrosshairTarget();
+                } else {
+                    target = FindClosestTarget(firePoint);
+                }
 
-            if (target.playerPtr && target.headPos != Vector3::Zero()) {
-                Vector3 targetPos = target.headPos;
-                if (!g_BulletTrackLockHead) targetPos.Y -= 0.5f;
-                Vector3 dir = targetPos - firePoint;
+                if (target.playerPtr && target.headPos != Vector3::Zero()) {
+                    float bulletSpeed = GetTrackingBulletSpeed(weapon);
+                    Vector3 aimPoint = PredictAimPoint(firePoint, target, bulletSpeed);
+                    Vector3 dir = aimPoint - firePoint;
 
-                if (Vector3::Magnitude(dir) > 0.001f) {
-                    *_shootDir = Vector3::Normalized(dir);  // 通过指针直接修改
+                    if (Vector3::Magnitude(dir) > 0.001f && IsFiniteVector(dir)) {
+                        finalShootDir = Vector3::Normalized(dir);
+                    }
                 }
             }
         }
     } catch (...) {}
-    // 不调用 old_FireBullet！Dobby 自动恢复寄存器执行原始函数（用我们修改过的 *_shootDir）
+
+    if (old_FireBullet) old_FireBullet(weapon, finalShootDir, method);
 }
 
 // NpcControl.FireBullet Hook（NPC开火直接放行）
-void Hooked_NpcFireBullet(void* npc, Vector3* _shootDir) {
-    // NPC不追踪 → 直接返回，Dobby执行原始函数
+void Hooked_NpcFireBullet(void* npc, Vector3 _shootDir, void* method) {
+    if (old_NpcFireBullet) old_NpcFireBullet(npc, _shootDir, method);
 }
 
 // Bullet.OnEnable Hook（不打Unity API — Vector3参数同样是寄存器问题）
-void Hooked_BulletOnEnable(void* bullet) {
-    old_BulletOnEnable(bullet);
-    // 子弹追踪不在此处做传送（Transform_set_position传Vector3有同样SIMD寄存器问题）
-    // 效果由Update钩子中的5000子弹速度 + Bullet.OnCollisionEnter墙壁穿透保证
+void Hooked_BulletOnEnable(void* bullet, void* method) {
+    if (old_BulletOnEnable) old_BulletOnEnable(bullet, method);
+
+    if (g_BulletTrackEnabled) {
+        ApplyTrackingBulletStats(bullet);
+    }
 }
 
-// Bullet.OnCollisionEnter Hook（追踪开启时所有碰撞直通，不做穿透/过滤）
-void Hooked_BulletOnCollisionEnter(void* bullet, void* collision) {
-    // collision 是 UnityEngine.Collision，不是 Component，不能调 Component_get_transform
-    // 追踪开启时所有碰撞原样放行（5000速度下子弹早已命中敌人）
+void* FindCharacterFromCollision(void* collision, bool* outIsNpc) {
+    if (!collision || !Collision_get_collider) return nullptr;
+    if (!IsLikelyIl2CppObjectPointer(collision)) return nullptr;
+    if (outIsNpc) *outIsNpc = false;
+
+    try {
+        void* collider = Collision_get_collider(collision, nullptr);
+        if (!m_CachedPtr(collider)) return nullptr;
+
+        static void* npcType = nullptr;
+        static void* playerType = nullptr;
+        if (!npcType) npcType = Type_GetTypeName(Il2CppString::CreateMonoString("NpcControl,Assembly-CSharp.dll"), nullptr);
+        if (!playerType) playerType = Type_GetTypeName(Il2CppString::CreateMonoString("PlayerControl,Assembly-CSharp.dll"), nullptr);
+
+        if (npcType) {
+            void* npc = Component_GetComponentInParent ?
+                Component_GetComponentInParent(collider, npcType, nullptr) :
+                nullptr;
+            if (m_CachedPtr(npc)) {
+                if (outIsNpc) *outIsNpc = true;
+                return npc;
+            }
+        }
+
+        if (playerType) {
+            void* player = Component_GetComponentInParent ?
+                Component_GetComponentInParent(collider, playerType, nullptr) :
+                nullptr;
+            if (m_CachedPtr(player)) return player;
+        }
+    } catch (...) {}
+
+    return nullptr;
+}
+
+// Bullet.OnCollisionEnter Hook（追踪开启时忽略墙体/掩体，只把角色碰撞交给原函数结算）
+void Hooked_BulletOnCollisionEnter(void* bullet, void* collision, void* method) {
+    if (g_BulletTrackEnabled) {
+        bool hitIsNpc = false;
+        void* hitCharacter = FindCharacterFromCollision(collision, &hitIsNpc);
+        if (!hitCharacter) {
+            return;
+        }
+
+        int hitTeam = SafeReadTeamHash(hitCharacter, GetTeamOffset(hitIsNpc));
+        if (IsTeammate(hitTeam)) {
+            return;
+        }
+    }
+
     if (old_BulletOnCollisionEnter) {
-        old_BulletOnCollisionEnter(bullet, collision);
+        old_BulletOnCollisionEnter(bullet, collision, method);
     }
 }
 
@@ -672,25 +910,16 @@ void ShowMenu() {
 }
 
 // 获取玩家血量信息（dump更新：health是NpcControl/PlayerControl的int32字段，偏移0x48/0x38）
-void GetPlayerHealthInfo(void* player, float& currentHealth, float& maxHealth) {
+void GetPlayerHealthInfo(void* player, bool isNpc, float& currentHealth, float& maxHealth) {
     currentHealth = 0.0f;
     maxHealth = 100.0f;
     
     if (!m_CachedPtr(player)) return;
     
     try {
-        // 直接读取health字段（NpcControl: 0x48, PlayerControl: 0x38）
-        // 先尝试NpcControl偏移
-        int* healthPtrNpc = (int*)((uintptr_t)player + 0x48);
-        if (healthPtrNpc && *healthPtrNpc > 0 && *healthPtrNpc <= 10000) {
-            currentHealth = (float)*healthPtrNpc;
-            maxHealth = 1000.0f;
-            return;
-        }
-        // 再尝试PlayerControl偏移
-        int* healthPtrPlayer = (int*)((uintptr_t)player + 0x38);
-        if (healthPtrPlayer && *healthPtrPlayer > 0 && *healthPtrPlayer <= 10000) {
-            currentHealth = (float)*healthPtrPlayer;
+        int* healthPtr = (int*)((uintptr_t)player + GetHealthOffset(isNpc));
+        if (healthPtr && *healthPtr > 0 && *healthPtr <= 10000) {
+            currentHealth = (float)*healthPtr;
             maxHealth = 1000.0f;
             return;
         }
@@ -705,28 +934,9 @@ void GetPlayerHealthInfo(void* player, float& currentHealth, float& maxHealth) {
     }
 }
 
-// 获取玩家队伍哈希ID（dump更新：team是String字段，转为哈希值比较）
+// 获取 PlayerControl 队伍哈希ID（PlayerControl.team = 0x50）
 int GetPlayerTeamId(void* player) {
-    if (!m_CachedPtr(player)) return -1;
-    
-    try {
-        // NpcControl.team 偏移 0x38 (String), PlayerControl.team 偏移 0x50 (String)
-        MonoString** teamStrPtrNpc = (MonoString**)((uintptr_t)player + 0x38);
-        if (teamStrPtrNpc && *teamStrPtrNpc) {
-            std::string teamStr = (*teamStrPtrNpc)->ToString();
-            if (!teamStr.empty()) return std::hash<std::string>{}(teamStr) % 10000;
-        }
-        
-        MonoString** teamStrPtrPlayer = (MonoString**)((uintptr_t)player + 0x50);
-        if (teamStrPtrPlayer && *teamStrPtrPlayer) {
-            std::string teamStr = (*teamStrPtrPlayer)->ToString();
-            if (!teamStr.empty()) return std::hash<std::string>{}(teamStr) % 10000;
-        }
-    } catch (...) {
-        return -1;
-    }
-    
-    return -1;
+    return SafeReadTeamHash(player, GetTeamOffset(false));
 }
 
 // 检查是否为队友（简化版：在RefreshPlayerList中已过滤本地玩家）
@@ -737,17 +947,16 @@ bool IsTeammate(int playerTeamId) {
     static int localTeamHash = -2;  // -2 = 未初始化, -1 = 获取失败
     if (localTeamHash == -2) {
         localTeamHash = -1;
-        void* playerType = Type_GetTypeName(Il2CppString::CreateMonoString("PlayerControl,Assembly-CSharp.dll"));
+        void* playerType = Type_GetTypeName(Il2CppString::CreateMonoString("PlayerControl,Assembly-CSharp.dll"), nullptr);
         if (playerType) {
-            MonoArray<void**>* players = Object_FindObjectsOfType(playerType);
+            MonoArray<void**>* players = Object_FindObjectsOfType(playerType, nullptr);
             if (players && players->getLength() > 0) {
                 for (int i = 0; i < players->getLength(); i++) {
                     void* p = players->getPointer()[i];
                     if (!m_CachedPtr(p)) continue;
-                    // PlayerControl.team 偏移 0x50 (String)
-                    MonoString** ts = (MonoString**)((uintptr_t)p + 0x50);
-                    if (ts && *ts && (*ts)->getLength() > 0) {
-                        localTeamHash = std::hash<std::string>{}((*ts)->ToString()) % 10000;
+                    int teamHash = SafeReadTeamHash(p, GetTeamOffset(false));
+                    if (teamHash >= 0) {
+                        localTeamHash = teamHash;
                         break;
                     }
                 }
@@ -762,29 +971,22 @@ bool IsTeammate(int playerTeamId) {
 void *camera = nullptr;
 
 // 安全读取MonoString（防止读非指针数据崩溃）
-int SafeReadTeamHash(void* obj, int npcTeamOffset, int playerTeamOffset) {
+// 传入确定的偏移量，并使用严格的指针校验
+int SafeReadTeamHash(void* obj, int teamOffset) {
     if (!m_CachedPtr(obj)) return -1;
-    // 先尝试NpcControl的team偏移 0x38
-    uintptr_t val = *(uintptr_t*)((uintptr_t)obj + npcTeamOffset);
-    // 验证是否为有效指针（高16位应该有内容，非0非全F）
-    if (val > 0x1000 && val < 0x7fffffffffff) {
-        MonoString* str = (MonoString*)val;
+    
+    try {
+        // 读取指定偏移的指针。调用方必须传入准确的 NpcControl/PlayerControl 偏移。
+        void* strPtr = *(void**)((uintptr_t)obj + teamOffset);
+        if (!IsLikelyIl2CppObjectPointer(strPtr)) return -1;
+
+        MonoString* str = (MonoString*)strPtr;
         int len = str->getLength();
         if (len > 0 && len < 64) {
-            try { return std::hash<std::string>{}(str->ToString()) % 10000; }
-            catch (...) {}
+            return std::hash<std::string>{}(str->ToString()) % 10000;
         }
-    }
-    // 再尝试PlayerControl的team偏移 0x50
-    val = *(uintptr_t*)((uintptr_t)obj + playerTeamOffset);
-    if (val > 0x1000 && val < 0x7fffffffffff) {
-        MonoString* str = (MonoString*)val;
-        int len = str->getLength();
-        if (len > 0 && len < 64) {
-            try { return std::hash<std::string>{}(str->ToString()) % 10000; }
-            catch (...) {}
-        }
-    }
+    } catch (...) {}
+    
     return -1;
 }
 
@@ -797,24 +999,27 @@ void RefreshPlayerList(bool forceRefreshEntities) {
     // 1. 低频网络/实体搜索：每 60 帧（大约 1 秒）才重新用 FindObjectsOfType 搜索一次敌人，彻底解决主线程卡顿
     if (forceRefreshEntities || frameCount % 60 == 0) {
         std::lock_guard<std::mutex> infoLock(g_PlayersInfoMutex);
+        std::vector<PlayerInfo> previousPlayers = g_PlayersInfo;
         g_PlayersInfo.clear();
 
         try {
             // --- 搜索 NpcControl（AI敌人） ---
-            void* npcType = Type_GetTypeName(Il2CppString::CreateMonoString("NpcControl,Assembly-CSharp.dll"));
+            void* npcType = Type_GetTypeName(Il2CppString::CreateMonoString("NpcControl,Assembly-CSharp.dll"), nullptr);
             if (npcType) {
-                MonoArray<void**>* npcList = Object_FindObjectsOfType(npcType);
+                MonoArray<void**>* npcList = Object_FindObjectsOfType(npcType, nullptr);
                 if (npcList && npcList->getLength() > 0) {
                     for (int i = 0; i < npcList->getLength(); i++) {
                         void* obj = npcList->getPointer()[i];
                         if (!m_CachedPtr(obj)) continue;
                         PlayerInfo info;
                         info.playerPtr = obj;
-                        info.team = SafeReadTeamHash(obj, 0x38, 0x50);
+                        info.isNpc = true;
+                        info.team = SafeReadTeamHash(obj, GetTeamOffset(true));
                         info.currentHealth = 100.0f;   // 默认值，下一帧位置同步时更新为真实值
                         info.maxHealth = 100.0f;
+                        RestoreMotionCache(info, previousPlayers);
                         if (Object_get_name) {
-                            try { MonoString* ns = Object_get_name(obj); if (ns) info.name = ns->ToString(); }
+                            try { MonoString* ns = Object_get_name(obj, nullptr); if (ns) info.name = ns->ToString(); }
                             catch (...) { info.name = "NPC"; }
                         }
                         g_PlayersInfo.push_back(info);
@@ -823,24 +1028,26 @@ void RefreshPlayerList(bool forceRefreshEntities) {
             }
 
             // --- 搜索 PlayerControl（真人玩家） ---
-            void* playerType = Type_GetTypeName(Il2CppString::CreateMonoString("PlayerControl,Assembly-CSharp.dll"));
+            void* playerType = Type_GetTypeName(Il2CppString::CreateMonoString("PlayerControl,Assembly-CSharp.dll"), nullptr);
             if (playerType) {
-                MonoArray<void**>* playerList = Object_FindObjectsOfType(playerType);
+                MonoArray<void**>* playerList = Object_FindObjectsOfType(playerType, nullptr);
                 if (playerList && playerList->getLength() > 0) {
                     static int localTeamHash = -2;
                     for (int i = 0; i < playerList->getLength(); i++) {
                         void* obj = playerList->getPointer()[i];
                         if (!m_CachedPtr(obj)) continue;
-                        int teamHash = SafeReadTeamHash(obj, 0x38, 0x50);
-                        if (localTeamHash == -2) { localTeamHash = teamHash; continue; }
+                        int teamHash = SafeReadTeamHash(obj, GetTeamOffset(false));
+                        if (localTeamHash == -2 && teamHash >= 0) { localTeamHash = teamHash; continue; }
                         if (teamHash == localTeamHash && isTeamFilter) continue;
                         PlayerInfo info;
                         info.playerPtr = obj;
+                        info.isNpc = false;
                         info.team = teamHash;
                         info.currentHealth = 100.0f;   // 默认值
                         info.maxHealth = 100.0f;
+                        RestoreMotionCache(info, previousPlayers);
                         if (Object_get_name) {
-                            try { MonoString* ns = Object_get_name(obj); if (ns) info.name = ns->ToString(); }
+                            try { MonoString* ns = Object_get_name(obj, nullptr); if (ns) info.name = ns->ToString(); }
                             catch (...) { info.name = "Player"; }
                         }
                         g_PlayersInfo.push_back(info);
@@ -855,15 +1062,13 @@ void RefreshPlayerList(bool forceRefreshEntities) {
                     void* obj = g_PlayersInfo[idx].playerPtr;
                     if (!m_CachedPtr(obj)) continue;
                     if (isTeamFilter && IsTeammate(g_PlayersInfo[idx].team)) continue;
-                    uintptr_t animPtr = *(uintptr_t*)((uintptr_t)obj + 0xB8);
-                    if (animPtr <= 0x1000 || animPtr >= 0x7fffffffffff) continue;
-                    void* animator = (void*)animPtr;
-                    if (!m_CachedPtr(animator)) continue;
+                    void* animator = GetAnimatorFromCharacter(obj, g_PlayersInfo[idx].isNpc);
+                    if (!animator) continue;
                     
                     const std::vector<int> boneIds = {0,1,2,3,4,5,6,7,8,10,11,13,14,15,16,17,18};
                     for (int boneId : boneIds) {
                         try {
-                            void* bt = Animator_GetBoneTransform(animator, boneId);
+                            void* bt = Animator_GetBoneTransform(animator, boneId, nullptr);
                             if (m_CachedPtr(bt)) {
                                 BoneInfo bi;
                                 bi.transform = bt;
@@ -879,10 +1084,17 @@ void RefreshPlayerList(bool forceRefreshEntities) {
     }
 
     // 2. 高频位置同步：以下部分【每一帧都会执行】！由于去掉了耗时的全图搜索，只做坐标转换，速度极快且100%安全安全
+    static auto lastMotionSync = std::chrono::steady_clock::now();
+    auto nowMotionSync = std::chrono::steady_clock::now();
+    float deltaSeconds = std::chrono::duration<float>(nowMotionSync - lastMotionSync).count();
+    lastMotionSync = nowMotionSync;
+    if (deltaSeconds < 0.001f) deltaSeconds = 0.016f;
+    if (deltaSeconds > 0.20f) deltaSeconds = 0.05f;
+
     try {
-        void* cam = Camera_get_main();
+        void* cam = Camera_get_main(nullptr);
         if (m_CachedPtr(cam)) {
-            Vector3 camPos = Transform_getPosition(Component_get_transform(cam));
+            Vector3 camPos = Transform_getPosition(Component_get_transform(cam, nullptr));
             {
                 std::lock_guard<std::mutex> camLock(g_CameraMutex);
                 g_CameraPosition = camPos;
@@ -894,28 +1106,48 @@ void RefreshPlayerList(bool forceRefreshEntities) {
                     info.screenDepth = -1.0f;
                     continue;
                 }
+                Vector3 previousPosition = info.position;
+                Vector3 previousHeadPos = info.headPos;
+                bool hadPreviousPosition = info.hasLastPosition;
+
                 // 实时更新 3D 坐标与健康信息
                 info.position = Transform_getPosition(info.playerPtr);
-                GetPlayerHealthInfo(info.playerPtr, info.currentHealth, info.maxHealth);
+                GetPlayerHealthInfo(info.playerPtr, info.isNpc, info.currentHealth, info.maxHealth);
                 
                 // 获取最新精确头部 3D 坐标
                 info.headPos = info.position + Vector3(0, 1.6f, 0); 
                 if (Animator_GetBoneTransform) {
                     try {
-                        uintptr_t ap = *(uintptr_t*)((uintptr_t)info.playerPtr + 0xB8);
-                        if (ap > 0x1000 && ap < 0x7fffffffffff) {
-                            void* anim = (void*)ap;
-                            if (m_CachedPtr(anim)) {
-                                void* headBone = Animator_GetBoneTransform(anim, 11);
-                                if (m_CachedPtr(headBone)) info.headPos = Transform_get_position(headBone);
+                        void* anim = GetAnimatorFromCharacter(info.playerPtr, info.isNpc);
+                        if (anim) {
+                            void* headBone = Animator_GetBoneTransform(anim, 11, nullptr);
+                            if (m_CachedPtr(headBone)) {
+                                info.headPos = Transform_get_position(headBone, nullptr);
                             }
                         }
                     } catch (...) {}
                 }
 
+                Vector3 rigidVelocity = ReadCachedPlayerVelocity(info);
+                if (rigidVelocity != Vector3::Zero()) {
+                    info.velocity = rigidVelocity;
+                } else if (hadPreviousPosition &&
+                           previousPosition != Vector3::Zero() &&
+                           previousHeadPos != Vector3::Zero()) {
+                    Vector3 frameVelocity = (info.headPos - previousHeadPos) / deltaSeconds;
+                    if (IsFiniteVector(frameVelocity)) {
+                        info.velocity = ClampVectorMagnitude(frameVelocity, 60.0f);
+                    }
+                } else {
+                    info.velocity = Vector3::Zero();
+                }
+                info.lastPosition = info.position;
+                info.lastHeadPos = info.headPos;
+                info.hasLastPosition = true;
+
                 // 矩阵变换：计算最新的屏幕坐标
-                auto sfp = Camera_WorldToScreen(cam, info.position);
-                auto shp = Camera_WorldToScreen(cam, info.headPos);
+                auto sfp = Camera_WorldToScreen(cam, info.position, nullptr);
+                auto shp = Camera_WorldToScreen(cam, info.headPos, nullptr);
                 info.screenFootPos = ImVec2(sfp.X, sfp.Y);
                 info.screenHeadPos = ImVec2(shp.X, shp.Y);
                 info.screenDepth = (sfp.Z > 0.f && shp.Z > 0.f) ? sfp.Z : -1.0f;
@@ -926,8 +1158,8 @@ void RefreshPlayerList(bool forceRefreshEntities) {
                 std::lock_guard<std::mutex> boneLock2(g_BoneInfoMutex);
                 for (auto& [key, bi] : g_BoneInfos) {
                     if (m_CachedPtr(bi.transform)) {
-                        bi.position = Transform_get_position(bi.transform);
-                        auto sp = Camera_WorldToScreen(cam, bi.position);
+                        bi.position = Transform_get_position(bi.transform, nullptr);
+                        auto sp = Camera_WorldToScreen(cam, bi.position, nullptr);
                         bi.screenPos = ImVec2(sp.X, sp.Y);
                         bi.screenDepth = sp.Z;
                     }
@@ -942,7 +1174,7 @@ void SyncESPDataOnMainThread() {
     static int frameCount = 0;
     frameCount++;
 
-    void* cam = Camera_get_main();
+    void* cam = Camera_get_main(nullptr);
     if (!m_CachedPtr(cam)) return;
 
     // 【优化 1】：每 60 帧（约 1 秒）执行一次耗时的遍历，避免掉帧卡顿
@@ -950,18 +1182,19 @@ void SyncESPDataOnMainThread() {
         std::vector<PlayerInfo> tempPlayers;
         
         // 搜索 NpcControl (这里可以放你原来的搜索逻辑)
-        void* npcType = Type_GetTypeName(Il2CppString::CreateMonoString("NpcControl,Assembly-CSharp.dll"));
+        void* npcType = Type_GetTypeName(Il2CppString::CreateMonoString("NpcControl,Assembly-CSharp.dll"), nullptr);
         if (npcType) {
-            MonoArray<void**>* npcList = Object_FindObjectsOfType(npcType);
+            MonoArray<void**>* npcList = Object_FindObjectsOfType(npcType, nullptr);
             if (npcList && npcList->getLength() > 0) {
                 for (int i = 0; i < npcList->getLength(); i++) {
                     void* obj = npcList->getPointer()[i];
                     if (!m_CachedPtr(obj)) continue;
                     PlayerInfo info;
                     info.playerPtr = obj;
-                    info.team = SafeReadTeamHash(obj, 0x38, 0x50);
+                    info.isNpc = true;
+                    info.team = SafeReadTeamHash(obj, GetTeamOffset(true));
                     if (Object_get_name) {
-                        try { MonoString* ns = Object_get_name(obj); if (ns) info.name = ns->ToString(); }
+                        try { MonoString* ns = Object_get_name(obj, nullptr); if (ns) info.name = ns->ToString(); }
                         catch (...) { info.name = "NPC"; }
                     }
                     tempPlayers.push_back(info);
@@ -977,7 +1210,7 @@ void SyncESPDataOnMainThread() {
     }
 
     // 【优化 2】：每帧实时更新 3D 和 屏幕坐标（运行在主线程，0 延迟无残影！）
-    Vector3 camPos = Transform_getPosition(Component_get_transform(cam));
+    Vector3 camPos = Transform_getPosition(Component_get_transform(cam, nullptr));
     {
         std::lock_guard<std::mutex> camLock(g_CameraMutex);
         g_CameraPosition = camPos;
@@ -991,25 +1224,24 @@ void SyncESPDataOnMainThread() {
         }
 
         // 实时获取血量与 3D 位置
-        GetPlayerHealthInfo(info.playerPtr, info.currentHealth, info.maxHealth);
+        GetPlayerHealthInfo(info.playerPtr, info.isNpc, info.currentHealth, info.maxHealth);
         info.position = Transform_getPosition(info.playerPtr);
         
         // 获取头部 3D 坐标
         info.headPos = info.position + Vector3(0, 1.6f, 0);
         if (Animator_GetBoneTransform) {
-            uintptr_t ap = *(uintptr_t*)((uintptr_t)info.playerPtr + 0xB8);
-            if (ap > 0x1000 && ap < 0x7fffffffffff) {
-                void* anim = (void*)ap;
+            try {
+                void* anim = GetAnimatorFromCharacter(info.playerPtr, info.isNpc);
                 if (m_CachedPtr(anim)) {
-                    void* headBone = Animator_GetBoneTransform(anim, 11);
-                    if (m_CachedPtr(headBone)) info.headPos = Transform_get_position(headBone);
+                    void* headBone = Animator_GetBoneTransform(anim, 11, nullptr);
+                    if (m_CachedPtr(headBone)) info.headPos = Transform_get_position(headBone, nullptr);
                 }
-            }
+            } catch (...) {}
         }
 
         // 实时转换为屏幕坐标
-        auto sfp = Camera_WorldToScreen(cam, info.position);
-        auto shp = Camera_WorldToScreen(cam, info.headPos);
+        auto sfp = Camera_WorldToScreen(cam, info.position, nullptr);
+        auto shp = Camera_WorldToScreen(cam, info.headPos, nullptr);
         info.screenFootPos = ImVec2(sfp.X, sfp.Y);
         info.screenHeadPos = ImVec2(shp.X, shp.Y);
         info.screenDepth = (sfp.Z > 0.f && shp.Z > 0.f) ? sfp.Z : -1.0f;
@@ -1022,9 +1254,8 @@ void SyncESPDataOnMainThread() {
 
 
 // Update函数（主线程帧回调）
-void Update(void * UpdateInstance) {
+void Update(void * instance, void* method) {
 
-    // 【核心改动】如果开启了透视或者自瞄，在主线程每帧高频更新位置坐标
     if (isESP || g_BulletTrackEnabled) {
         static bool firstUpdate = true;
         if (firstUpdate) {
@@ -1040,9 +1271,9 @@ void Update(void * UpdateInstance) {
         static int weaponSearchFrame = 0;
         weaponSearchFrame++;
         if (weaponSearchFrame % 60 == 0) {
-            void* weaponType = Type_GetTypeName(Il2CppString::CreateMonoString("Weapon,Assembly-CSharp.dll"));
+            void* weaponType = Type_GetTypeName(Il2CppString::CreateMonoString("Weapon,Assembly-CSharp.dll"), nullptr);
             if (weaponType) {
-                MonoArray<void**>* weaponList = Object_FindObjectsOfType(weaponType);
+                MonoArray<void**>* weaponList = Object_FindObjectsOfType(weaponType, nullptr);
                 if (weaponList && weaponList->getLength() > 0) {
                     std::lock_guard<std::mutex> weaponLock(g_WeaponMutex);
                     g_WeaponObjects.clear();
@@ -1062,16 +1293,14 @@ void Update(void * UpdateInstance) {
                 if (!m_CachedPtr(weapon)) continue;
                 if (g_WeaponModEnabled) ModifyWeapon(weapon);
                 if (g_BulletTrackEnabled) {
-                    // 直接写 Weapon.bulletSpeed 偏移 0x3C，速度5000=几乎瞬间命中
-                    int* speedPtr = (int*)((uintptr_t)weapon + 0x3C);
-                    if (speedPtr) *speedPtr = 5000;
+                    ApplyTrackingWeaponStats(weapon);
                 }
             }
         }
     }
 
     // 调用原函数
-    if (old_Update) old_Update(UpdateInstance);
+  if (old_Update) old_Update(instance, method);
 }
 
 // 绘制血量条
@@ -1174,7 +1403,7 @@ void DrawESP(ImDrawList *draw, int screenWidth, int screenHeight) {
                 bool haveCamera = (cameraPos != Vector3::Zero());
 
                 for(const auto& playerInfo : g_PlayersInfo) {
-                    if(IsTeammate(playerInfo.team) || !m_CachedPtr(playerInfo.playerPtr)) continue;
+                    if(IsTeammate(playerInfo.team)) continue;
 
                     // 使用预计算的屏幕坐标（后台线程已计算）
                     if(playerInfo.screenDepth <= 0.f) continue;
@@ -1283,10 +1512,11 @@ void DrawESP(ImDrawList *draw, int screenWidth, int screenHeight) {
                         // 准星模式：屏幕中心最近的敌人
                         float minScrDist = 999999.0f;
                         for (const auto& info : g_PlayersInfo) {
-                            if (IsTeammate(info.team) || !m_CachedPtr(info.playerPtr)) continue;
+                            if (IsTeammate(info.team)) continue;
                             if (info.screenDepth <= 0.f) continue;
                             ImVec2 hs(info.screenHeadPos.x, screenHeight - info.screenHeadPos.y);
                             float scrDist = sqrtf((hs.x-crosshair.x)*(hs.x-crosshair.x)+(hs.y-crosshair.y)*(hs.y-crosshair.y));
+                            if (scrDist > g_TrackCircleRadius) continue;
                             if (scrDist < minScrDist) {
                                 minScrDist = scrDist;
                                 trackedHead = hs;
@@ -1297,7 +1527,7 @@ void DrawESP(ImDrawList *draw, int screenWidth, int screenHeight) {
                         // 最近距离模式：3D世界距离最近的敌人
                         float minDist = g_BulletTrackMaxDist + 1.0f;
                         for (const auto& info : g_PlayersInfo) {
-                            if (IsTeammate(info.team) || !m_CachedPtr(info.playerPtr)) continue;
+                            if (IsTeammate(info.team)) continue;
                             if (info.screenDepth <= 0.f) continue;
                             float d = Vector3::Distance(cameraPos, info.position);
                             if (d < minDist && d <= g_BulletTrackMaxDist) {
@@ -1398,42 +1628,49 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
 // 函数指针初始化
 void initializeFunctionPointers() {
-    Object_Destroy = (void* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Object", "Destroy", 1);
+    Object_Destroy = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Object", "Destroy", 1);
     Camera_WorldToScreen = (Camera_WorldToScreen_t)GET_METHOD("UnityEngine.dll", "UnityEngine", "Camera", "WorldToScreenPoint", 1);
-    Component_get_transform = (void* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Component", "get_transform", 0);
-    Transform_get_position = (Vector3 (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Transform", "get_position", 0);
-    Transform_set_position = (void (ARM64_CALL *)(void*, Vector3))GET_METHOD("UnityEngine.dll", "UnityEngine", "Transform", "set_position", 1);
+    Component_get_transform = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Component", "get_transform", 0);
+    Transform_get_position = (Vector3 (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Transform", "get_position", 0);
+    Transform_set_position = (void (ARM64_CALL *)(void*, Vector3, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Transform", "set_position", 1);
     Object_FindObjectsOfType = (FindObjectsFunc_t)GET_METHOD("UnityEngine.dll", "UnityEngine", "Object", "FindObjectsOfType", 1);    
     Type_GetTypeName = (GetTypeFunc_t)GET_METHOD("mscorlib.dll", "System", "Type", "GetType", 1);           
-    GameObject_get_transform = (void* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "get_transform", 0);
-    Object_IsNativeObjectAlive = (bool* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Object", "IsNativeObjectAlive", 1);  
-    GameObject_FindGameObjectsWithTag = (MonoArray<void**>* (ARM64_CALL *)(MonoString*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "FindGameObjectsWithTag", 1);
-    Camera_get_main = (void* (ARM64_CALL *)())GET_METHOD("UnityEngine.dll", "UnityEngine", "Camera", "get_main", 0);
+    GameObject_get_transform = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "get_transform", 0);
+    Object_IsNativeObjectAlive = (bool* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Object", "IsNativeObjectAlive", 1);  
+    GameObject_FindGameObjectsWithTag = (MonoArray<void**>* (ARM64_CALL *)(MonoString*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "FindGameObjectsWithTag", 1);
+    Camera_get_main = (void* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Camera", "get_main", 0);
+    Physics_get_gravity = (Vector3 (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.PhysicsModule.dll", "UnityEngine", "Physics", "get_gravity", 0);
     
     // 【修复】GameObject.get_gameObject → 属性名可能是 gameObject 不带 get_ 前缀
-    GameObject_get_gameObject = (void* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "gameObject", 0);
+    GameObject_get_gameObject = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "gameObject", 0);
     if (!GameObject_get_gameObject) {
-        GameObject_get_gameObject = (void* (ARM64_CALL *)(void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "get_gameObject", 0);
+        GameObject_get_gameObject = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "GameObject", "get_gameObject", 0);
     }
     
     // 【修复】Screen.SetResolution 参数数量修正：3个参数 (int, int, bool)
-    Screen_SetResolution = (void (ARM64_CALL *)(int, int, bool))GET_METHOD("UnityEngine.dll", "UnityEngine", "Screen", "SetResolution", 3);
+    Screen_SetResolution = (void (ARM64_CALL *)(int, int, bool, void*))GET_METHOD("UnityEngine.dll", "UnityEngine", "Screen", "SetResolution", 3);
     Object_get_name = (Object_get_name_t)GET_METHOD("UnityEngine.CoreModule.dll", "UnityEngine", "Object", "get_name", 0);
     
     // 【dump更新】Player类不存在，health和team是NpcControl/PlayerControl的字段，已通过偏移读取
-    Component_GetComponent = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.CoreModule.dll", "UnityEngine", "Component", "GetComponent", 1);
+    Component_GetComponent = (void* (ARM64_CALL *)(void*, void*, void*))GET_METHOD("UnityEngine.CoreModule.dll", "UnityEngine", "Component", "GetComponent", 1);
+    Component_GetComponentInParent = (void* (ARM64_CALL *)(void*, void*, void*))GET_METHOD("UnityEngine.CoreModule.dll", "UnityEngine", "Component", "GetComponentInParent", 1);
+    Collision_get_collider = (void* (ARM64_CALL *)(void*, void*))GET_METHOD("UnityEngine.PhysicsModule.dll", "UnityEngine", "Collision", "get_collider", 0);
     Animator_GetBoneTransform = (GetBoneTransform_t)GET_METHOD("UnityEngine.AnimationModule.dll", "UnityEngine", "Animator", "GetBoneTransform", 1);
+    HOOK_LOGI("Collision.get_collider: %p", Collision_get_collider);
+    HOOK_LOGI("Component.GetComponentInParent: %p", Component_GetComponentInParent);
     HOOK_LOGI("Animator.GetBoneTransform: %p", Animator_GetBoneTransform);
     
-    // ======= 子弹追踪已改用 Bullet.OnEnable 直接操控子弹速率方向 =======
-    // FireBullet 不能 hook：Vector3 在 ARM64 SIMD 寄存器(v0-v2)中，C++ 无法访问
-    HOOK_LOGI("⚠️ FireBullet Hook 禁用中（Vector3 在SIMD寄存器，改用Bullet.OnEnable）");
-    /*
+    // ======= 挂载 Weapon.FireBullet：修改射击方向并显式调用原函数 =======
     void* fireBulletAddr = GET_METHOD("Assembly-CSharp.dll", "", "Weapon", "FireBullet", 1);
     if (fireBulletAddr && !old_FireBullet) {
         DobbyHook(fireBulletAddr, (void*)Hooked_FireBullet, (void**)&old_FireBullet);
         HOOK_LOGI("✅ Weapon.FireBullet 挂载成功: %p", fireBulletAddr);
+    } else if (!fireBulletAddr) {
+        HOOK_LOGE("❌ Weapon.FireBullet 挂载失败");
     }
+
+    /*
+    // NPC开火不参与子弹追踪，通常不需要挂载。
     void* npcFireBulletAddr = GET_METHOD("Assembly-CSharp.dll", "", "NpcControl", "FireBullet", 1);
     if (npcFireBulletAddr && !old_NpcFireBullet) {
         DobbyHook(npcFireBulletAddr, (void*)Hooked_NpcFireBullet, (void**)&old_NpcFireBullet);
@@ -1441,7 +1678,14 @@ void initializeFunctionPointers() {
     }
     */
 
-    // 【注意】Bullet.OnEnable 不挂载 — 无法安全调用 Transform_set_position (Vector3 参数同 SIMD 寄存器问题)
+    // ======= 挂载 Bullet.OnEnable：扩大 Bullet.range，避免远距离被 traveledDist 截断 =======
+    void* bulletEnableAddr = GET_METHOD("Assembly-CSharp.dll", "", "Bullet", "OnEnable", 0);
+    if (bulletEnableAddr && !old_BulletOnEnable) {
+        DobbyHook(bulletEnableAddr, (void*)Hooked_BulletOnEnable, (void**)&old_BulletOnEnable);
+        HOOK_LOGI("✅ Bullet.OnEnable 挂载成功: %p", bulletEnableAddr);
+    } else if (!bulletEnableAddr) {
+        HOOK_LOGE("❌ Bullet.OnEnable 挂载失败");
+    }
 
     // ======= 挂载 Bullet.OnCollisionEnter（穿透墙壁：非敌人碰撞不触发，子弹穿透继续飞） =======
     void* bulletColAddr = GET_METHOD("Assembly-CSharp.dll", "", "Bullet", "OnCollisionEnter", 1);
@@ -1451,8 +1695,6 @@ void initializeFunctionPointers() {
     } else {
         HOOK_LOGE("❌ Bullet.OnCollisionEnter 挂载失败");
     }
-
-    // 【注意】Bullet.OnEnable 暂不挂载（传送子弹到敌人头部之前导致崩溃）
 
     // ======= 挂载主线程 Update 钩子（主选PlayerControl，备选GameManager/NpcControl/GameLibrary） =======
     void* updateAddr = GET_METHOD("Assembly-CSharp.dll", "", "PlayerControl", "Update", 0);
